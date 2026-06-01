@@ -1,0 +1,3 @@
+[submodule "Upscaling Model/Real-ESRGAN"]
+	path = Upscaling Model/Real-ESRGAN
+	url = https://github.com/xinntao/Real-ESRGAN.git

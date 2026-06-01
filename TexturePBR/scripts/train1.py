@@ -1,0 +1,661 @@
+import os
+import random
+import lpips
+import torch
+import cv2
+import csv
+import kornia
+import numpy as np
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import DataLoader
+from pbr_discriminator import PBRPatchDiscriminator
+from pbr_unet import PBRMapGeneratorUNet
+from torchvision import transforms
+import torchvision.models as models
+from tqdm import tqdm
+from PIL import Image
+import torchvision.transforms.functional as F_t
+import torch.nn.functional as F_n
+from system_settings import *
+import matplotlib.pyplot as plt
+
+#----------------------------------------------------------------------------------------------------------#
+
+IMAGE_RESOLUTION = 1024
+CROP_SIZE = 256
+
+to_pil = transforms.ToPILImage()
+
+#----------------------------------------------------------------------------------------------------------#
+
+def save_checkpoint(generator, discriminator, g_optimizer, d_optimizer,  g_scaler, d_scaler, epoch, loss, best_loss, path):
+    torch.save({
+        'epoch': epoch,
+        'generator': generator.state_dict(),
+        'discriminator': discriminator.state_dict(),
+        'g_optimizer': g_optimizer.state_dict(),
+        'd_optimizer': d_optimizer.state_dict(),
+        'g_scaler': g_scaler.state_dict(),
+        'd_scaler': d_scaler.state_dict(),
+        'loss': loss,
+        'best_loss': best_loss
+    }, path)
+
+#----------------------------------------------------------------------------------------------------------#
+
+def load_checkpoint(generator, discriminator, g_optimizer, d_optimizer,  g_scaler, d_scaler, path, device):
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Checkpoint file not found at {path}")
+    checkpoint = torch.load(path, map_location=device)
+
+    generator.load_state_dict(checkpoint.get('generator', {}))
+    discriminator.load_state_dict(checkpoint.get('discriminator', {}))
+    g_optimizer.load_state_dict(checkpoint.get('g_optimizer', {}))
+    d_optimizer.load_state_dict(checkpoint.get('d_optimizer', {}))
+    g_scaler.load_state_dict(checkpoint.get('g_scaler', {}))
+    d_scaler.load_state_dict(checkpoint.get('d_scaler', {}))
+
+    start_epoch = checkpoint.get('epoch', 0) + 1
+    loss = checkpoint.get('loss', None)
+    best_loss = checkpoint.get('best_loss', None)
+
+    print(f"Checkpoint loaded from epoch {start_epoch + 1}")
+
+    return {
+        "epoch" : start_epoch,
+        "generator" : generator,
+        "discriminator" : discriminator,
+        "g_optimizer" : g_optimizer,
+        "d_optimizer" : d_optimizer,
+        "g_scaler" : g_scaler,
+        "d_scaler" : d_scaler,
+        "loss" : loss,
+        "best_loss" : best_loss
+    }
+
+#----------------------------------------------------------------------------------------------------------#
+
+def normalize_patch(patch):
+    patch = patch.clone()
+    patch = (patch - patch.min()) / (patch.max() - patch.min() + 1e-8)
+    return patch
+
+#----------------------------------------------------------------------------------------------------------#
+
+def rgb_to_luminance(img):
+    r, g, b = img[:, 0:1, :, :], img[:, 1:2, :, :], img[:, 2:3, :, :]
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+#----------------------------------------------------------------------------------------------------------#
+
+def fft_luminance_loss(pred, target):
+    pred_lum = rgb_to_luminance(pred.float())
+    target_lum = rgb_to_luminance(target.float())
+    
+    pred_fft = torch.fft.fft2(pred_lum, norm='ortho')
+    target_fft = torch.fft.fft2(target_lum, norm='ortho')
+
+    pred_mag = torch.abs(pred_fft)
+    target_mag = torch.abs(target_fft)
+
+    return F.l1_loss(pred_mag, target_mag)
+
+#----------------------------------------------------------------------------------------------------------#
+
+def kornia_lab_loss(pred, target):
+    pred_lab = kornia.color.rgb_to_lab(pred)
+    target_lab = kornia.color.rgb_to_lab(target)
+
+    return F.mse_loss(pred_lab, target_lab)
+
+#----------------------------------------------------------------------------------------------------------#
+
+def rgb_to_yuv_tensor(img):
+    img_np = img.detach().cpu().numpy().transpose(0, 2, 3, 1)
+    img_np = (img_np * 255).astype(np.uint8)
+    yuv_list = [cv2.cvtColor(frame, cv2.COLOR_RGB2YUV) for frame in img_np]
+    yuv_np = np.stack(yuv_list).astype(np.float32) / 255.0
+    yuv_tensor = torch.tensor(yuv_np).permute(0, 3, 1, 2).to(img.device)
+    return yuv_tensor
+
+#----------------------------------------------------------------------------------------------------------#
+
+def yuv_loss(pred, target):
+    pred_yuv = rgb_to_yuv_tensor(pred)
+    target_yuv = rgb_to_yuv_tensor(target)
+
+    return F.mse_loss(pred_yuv, target_yuv)
+
+#----------------------------------------------------------------------------------------------------------#
+
+def gradient_loss(pred, target):
+    def get_gradients(img):
+        dx = torch.abs(img[:, :, :, :-1] - img[:, :, :, 1:])
+        dy = torch.abs(img[:, :, :-1, :] - img[:, :, 1:, :])
+        return dx, dy
+
+    pred_dx, pred_dy = get_gradients(pred)
+    target_dx, target_dy = get_gradients(target)
+
+    grad_loss = 0.5 * (F.l1_loss(pred_dx, target_dx) + F.l1_loss(pred_dy, target_dy))
+
+    return grad_loss
+
+#----------------------------------------------------------------------------------------------------------#
+
+def select_high_frequency_patches(input_patches, target_patches, top_k_ratio=0.01):
+    """
+    Selects top-k high-frequency patches based on Laplacian response of target patches.
+
+    Args:
+        input_patches (Tensor): [N, C, H, W] input patches.
+        target_patches (Tensor): [N, C, H, W] target patches.
+        top_k_ratio (float): Ratio (0.0 - 1.0) of top patches to keep (e.g. 0.01 = top 1%).
+
+    Returns:
+        input_topk (Tensor): Selected input patches [K, C, H, W].
+        target_topk (Tensor): Selected target patches [K, C, H, W].
+    """
+    assert input_patches.shape == target_patches.shape, "Input and target patches must match in shape."
+    N, C, H, W = target_patches.shape
+
+    # Laplacian kernel for frequency detection
+    laplacian_kernel = torch.tensor([[0, 1, 0],
+                                     [1, -4, 1],
+                                     [0, 1, 0]], dtype=torch.float32, device=target_patches.device)
+    laplacian_kernel = laplacian_kernel.expand(C, 1, 3, 3)
+
+    target_filtered = F.conv2d(target_patches, laplacian_kernel, padding=1, groups=C)
+    target_filtered = target_filtered.view(N, C, H, W)
+    freq_scores = target_filtered.abs().mean(dim=(1, 2, 3))
+
+    top_k = max(1, int(top_k_ratio * N))
+    top_indices = torch.topk(freq_scores, top_k).indices
+
+    input_topk = input_patches[top_indices]
+    target_topk = target_patches[top_indices]
+
+    return input_topk, target_topk
+
+#----------------------------------------------------------------------------------------------------------#
+
+class LoadPBRData(DataLoader):
+    def __init__(self, input_dir : str, target_dir : str, crop_size : int, image_size : int):
+        self.image_size = image_size
+        self.texture_maps = []
+        self.crop_size = crop_size
+
+        self.transform = transforms.Compose([
+            transforms.CenterCrop(self.crop_size),
+            transforms.ToTensor()
+        ])
+        self.color_jitter = transforms.Compose([
+            transforms.ColorJitter(
+                brightness=0.04,
+                contrast=0.04,
+                saturation=0.02
+                )
+        ])
+
+        if not os.path.exists(input_dir):
+            raise ValueError(f"Input map directory does not exist '{input_dir}'")
+        if not os.path.exists(target_dir):
+            raise ValueError(f"Target map directory does not exist '{target_dir}'")
+        
+        for input_map in os.listdir(input_dir):
+            input_map_path = os.path.join(input_dir, input_map)
+            target_map_path = os.path.join(target_dir, input_map)
+
+            if not os.path.exists(target_map_path):
+                continue
+
+            self.texture_maps.append((input_map_path, target_map_path))
+
+        print(f"{len(self.texture_maps)} texture maps successfully loaded")
+
+    def augment_image(self, image: Image.Image):
+        w, h = image.size
+        if min(w, h) != self.image_size:
+            image = F_t.resize(image, self.image_size, interpolation=Image.BICUBIC)
+
+        return self.transform(image)
+
+    def __len__(self):
+        return len(self.texture_maps)
+        
+    def __getitem__(self, idx):
+        input_map_path, target_map_path = self.texture_maps[idx]
+
+        input_map = Image.open(input_map_path).convert("RGB")
+        target_map = Image.open(target_map_path).convert("RGB")
+
+        if random.random() > 0.5:
+            input_map = F_t.hflip(input_map)
+            target_map = F_t.hflip(target_map)
+
+        if random.random() > 0.5:
+            input_map = F_t.vflip(input_map)
+            target_map = F_t.vflip(target_map)
+
+        input_map = self.augment_image(input_map)
+        target_map = self.augment_image(target_map)
+
+        input_map = self.color_jitter(input_map)
+
+        return input_map, target_map
+
+#----------------------------------------------------------------------------------------------------------#
+
+def train(
+        device            : str,
+        current_dir       : str,
+        dataset           : DataLoader,
+        pbr_generator     : PBRMapGeneratorUNet,
+        g_optimizer       : optim,
+        pbr_discriminator : PBRPatchDiscriminator,
+        d_optimizer       : optim,
+        run_name          : str,
+        ckpt_name         : str,
+        batch_size        = 8, 
+        num_workers       = 2, 
+        num_epochs        = 100, 
+        patch_size        = 64, 
+        top_k_patches     = 0.05,
+        resume_training   = False,
+        visualize         = False,
+        stat_freq         = 10,
+        override_optim    = True,
+        enable_logs       = True
+    ):
+
+    pretrained_dir = os.path.normpath(os.path.join(current_dir, '..', 'pretrained'))
+    loss_dir = os.path.normpath(os.path.join(current_dir, '..', 'training_logs'))
+
+    loss_graph_path = os.path.normpath(os.path.join(loss_dir, f'{run_name}_loss_graph.png'))
+    training_logs_path = os.path.normpath(os.path.join(loss_dir, f'{run_name}_logs.csv'))
+    prev_ckpt_path = os.path.normpath(os.path.join(pretrained_dir, f'{ckpt_name}.pth'))
+    checkpoint_path = os.path.normpath(os.path.join(pretrained_dir, f'{run_name}_ckpt.pth'))
+    last_model_path = os.path.normpath(os.path.join(pretrained_dir, f'{run_name}_last.pth'))
+
+    if not os.path.exists(pretrained_dir):
+        raise ValueError("Model dir does not exist")
+    
+    if not os.path.exists(loss_dir):
+        raise ValueError("Logs dir does not exist")
+    
+    dataloader = DataLoader(
+        dataset, 
+        batch_size, 
+        shuffle            = True, 
+        num_workers        = num_workers, 
+        pin_memory         = True, 
+        persistent_workers = True
+    )
+
+    dataloader_len = len(dataloader)
+
+    start_epoch = 0
+    best_loss = float('inf')
+
+    g_scaler = torch.amp.GradScaler()
+    d_scaler = torch.amp.GradScaler()
+
+    lpips_loss_fn = lpips.LPIPS(net='vgg')
+    lpips_loss_fn = lpips_loss_fn.to(device)
+
+    if resume_training:
+        if not os.path.exists(prev_ckpt_path):
+            raise ValueError(f"Checkpoint path does not exist '{prev_ckpt_path}'")
+        
+        checkpoint = load_checkpoint(
+             generator     = pbr_generator,
+             discriminator = pbr_discriminator,
+             g_optimizer   = g_optimizer, 
+             d_optimizer   = d_optimizer,
+             g_scaler      = g_scaler, 
+             d_scaler      = d_scaler,
+             path          = prev_ckpt_path, 
+             device        = device
+        )
+        pbr_generator = checkpoint['generator']
+        pbr_discriminator = checkpoint['discriminator']
+        g_scaler = checkpoint['g_scaler']
+        d_scaler = checkpoint['d_scaler']
+        best_loss = checkpoint['best_loss']
+
+        if not override_optim:
+            g_optimizer = checkpoint['g_optimizer']
+            d_optimizer = checkpoint['d_optimizer']
+
+        start_epoch = checkpoint['epoch']
+        num_epochs += start_epoch
+        print(f"Previous best loss: {best_loss:.6f}")
+
+    patch_stride = 0
+    patch_stride += patch_size
+
+    image_losses = {
+        "total" : [],
+        "mse" : [],
+        "lab" : [],
+        "fft" : []
+    }
+
+    patch_losses = {
+        "total" : [],
+        "mse" : [],
+        "lab" : [],
+        "fft" : []
+    }
+
+    epochs_executed = []
+
+    bce_loss = torch.nn.BCEWithLogitsLoss()
+
+    pbr_generator.train()
+    pbr_discriminator.train()
+
+    #----------------------- Training loop -----------------------#
+
+    for epoch in range(start_epoch, num_epochs):
+        total_loss = 0.0
+
+        for i, (input_map, target_map) in enumerate(dataloader):
+            if i % 2 == 0:
+                throttle_gpu_hotspot_temp()
+
+            input_map = input_map.to(device)
+            target_map = target_map.to(device)
+
+            #---------- Discriminator Training ----------#
+
+            with torch.amp.autocast(device_type="cuda"):
+                predicted_map = pbr_generator(input_map)
+
+                pred_detached = predicted_map.detach()
+
+                d_real = pbr_discriminator(target_map)
+                d_fake = pbr_discriminator(pred_detached)
+
+                real_labels = torch.ones_like(d_real)
+                fake_labels = torch.zeros_like(d_fake)
+
+                d_loss_real = bce_loss(d_real, real_labels)
+                d_loss_fake = bce_loss(d_fake, fake_labels)
+                d_loss = (d_loss_real + d_loss_fake) * 0.5
+
+            # Discriminator
+            d_scaler.scale(d_loss).backward()
+            d_scaler.step(d_optimizer)
+            d_scaler.update()
+            d_optimizer.zero_grad()
+
+            #---------- Discriminator Training ----------#
+
+            #------------ Generator Training ------------#
+
+            with torch.amp.autocast(device_type="cuda"):
+
+                # Discriminator loss
+                gan_pred = pbr_discriminator(predicted_map)
+                gan_loss = bce_loss(gan_pred, torch.ones_like(gan_pred))
+                lambda_gan = 0.2
+                wl_gan = lambda_gan * gan_loss
+
+                # MSE loss
+                mse_loss = F_n.mse_loss(predicted_map, target_map)
+                lambda_mse = 1.5
+                wl_mse = lambda_mse * mse_loss
+
+                # LCH loss
+                lch_loss = yuv_loss(predicted_map, target_map)
+                labmda_lch = 0.3 * 5.0
+                wl_lch = labmda_lch * lch_loss
+
+                # LAB loss
+                lab_loss = kornia_lab_loss(predicted_map, target_map)
+                labmda_lab = 0.2 * 0.001
+                wl_lab = labmda_lab * lab_loss
+
+                # Fourier transform loss
+                fft_loss = fft_luminance_loss(predicted_map, target_map)
+                lambda_fft = 0.6
+                wl_fft = lambda_fft * fft_loss
+
+                # LPIPS perceptual loss
+                vgg_loss = lpips_loss_fn(predicted_map * 2 - 1, target_map * 2 - 1).mean()
+                lambda_vgg = 0.08
+                wl_vgg = lambda_vgg * vgg_loss
+
+                cumulative_loss = (wl_mse + wl_lab + wl_fft + wl_vgg + wl_lch + wl_gan)
+
+            # Generator
+            g_scaler.scale(cumulative_loss).backward()
+            g_scaler.step(g_optimizer)
+            g_scaler.update()
+            g_optimizer.zero_grad()
+
+            #------------ Generator Training ------------#
+
+            #---------- Discriminator Patch Training ----------#
+
+            input_patches = input_map.unfold(2, patch_size, patch_stride).unfold(3, patch_size, patch_stride) # [B, C, H, W, PH, PW]
+            input_patches = input_patches.permute(0, 2, 3, 1, 4, 5)
+            target_patches = target_map.unfold(2, patch_size, patch_stride).unfold(3, patch_size, patch_stride) # [B, C, H, W, PH, PW]
+            target_patches = target_patches.permute(0, 2, 3, 1, 4, 5)
+
+            input_patches = input_patches.contiguous().view(-1, input_patches.shape[3], patch_size, patch_size) # [B, C, H, W]
+            target_patches = target_patches.contiguous().view(-1, target_patches.shape[3], patch_size, patch_size) # [B, C, H, W]
+
+            input_top_k, target_top_k = select_high_frequency_patches(input_patches, target_patches, top_k_ratio=top_k_patches) # [K, C, H, W]
+
+            # with torch.amp.autocast(device_type="cuda"):
+            #     pred_map_patch = pbr_generator(input_top_k)
+
+            #     pred_detached = pred_map_patch.detach()
+
+            #     d_real = pbr_discriminator(target_top_k)
+            #     d_fake = pbr_discriminator(pred_map_patch)
+
+            #     real_labels = torch.ones_like(d_real)
+            #     fake_labels = torch.zeros_like(d_fake)
+
+            #     d_loss_real = bce_loss(d_real, real_labels)
+            #     d_loss_fake = bce_loss(d_fake, fake_labels)
+            #     d_patch_loss = (d_loss_real + d_loss_fake) * 0.5
+
+            # # Discriminator
+            # d_scaler.scale(d_patch_loss).backward()
+            # d_scaler.step(d_optimizer)
+            # d_scaler.update()
+            # d_optimizer.zero_grad()
+
+            #---------- Discriminator Patch Training ----------#
+
+            #------------ Generator Patch Training ------------#
+
+            with torch.amp.autocast(device_type="cuda"):
+                pred_map_patch = pbr_generator(input_top_k)
+                
+                # Discriminator loss
+                gan_patch_pred = pbr_discriminator(pred_map_patch)
+                gan_patch_loss = bce_loss(gan_patch_pred, torch.ones_like(gan_patch_pred))
+                lambda_patch_gan = 0.2
+                wl_patch_gan = lambda_patch_gan * gan_patch_loss
+
+                # MSE loss
+                mse_patch_loss = F_n.mse_loss(pred_map_patch, target_top_k)
+                lambda_patch_mse = 1.5
+                wl_patch_mse = lambda_patch_mse * mse_patch_loss
+
+                # LCH loss
+                lch_patch_loss = yuv_loss(pred_map_patch, target_top_k)
+                labmda_patch_lch = 0.3 * 5.0
+                wl_patch_lch = labmda_patch_lch * lch_patch_loss
+
+                # LAB loss
+                lab_patch_loss = kornia_lab_loss(pred_map_patch, target_top_k)
+                labmda_patch_lab = 0.2 * 0.001
+                wl_patch_lab = labmda_patch_lab * lab_patch_loss
+
+                # Fourier transform loss
+                fft_patch_loss = fft_luminance_loss(pred_map_patch, target_top_k)
+                lambda_patch_fft = 0.6
+                wl_patch_fft = lambda_patch_fft * fft_patch_loss
+
+                # LPIPS perceptual loss
+                vgg_patch_loss = lpips_loss_fn(pred_map_patch * 2 - 1, target_top_k * 2 - 1).mean()
+                lambda_patch_vgg = 0.08
+                wl_patch_vgg = lambda_patch_vgg * vgg_patch_loss
+
+                cumulative_patch_loss = (wl_patch_mse + wl_patch_lab + wl_patch_fft 
+                                            + wl_patch_vgg + wl_patch_lch + wl_patch_gan)
+
+            # Generator
+            g_scaler.scale(cumulative_patch_loss).backward()
+            g_scaler.step(g_optimizer)
+            g_scaler.update()
+            g_optimizer.zero_grad()
+
+            #------------ Generator Patch Training ------------#
+
+            #---------------- Statistics ----------------#
+
+            total_loss += (cumulative_loss.item() + cumulative_patch_loss.item()) * 0.5
+
+            epochs_executed.append(epoch)
+
+            image_losses['total'].append(cumulative_loss.item())
+            image_losses['mse'].append(wl_mse.item())
+            image_losses['lab'].append(wl_lab.item())
+            image_losses['fft'].append(wl_fft.item())
+
+            patch_losses['total'].append(cumulative_patch_loss.item())
+            patch_losses['mse'].append(wl_patch_mse.item())
+            patch_losses['lab'].append(wl_patch_lab.item())
+            patch_losses['fft'].append(wl_patch_fft.item())
+
+            if (i+1) % stat_freq == 0:
+                print(f"\nEpoch [{epoch+1}/{num_epochs}], Iteration [{i+1}/{dataloader_len}]")
+                print(f" - Image loss: {cumulative_loss.item():.6f} " + 
+                      f"GAN loss: {wl_gan.item():.6f} " +
+                      f"MSE loss: {wl_mse.item():.6f} " +
+                      f"LAB loss: {wl_lab.item():.6f} " +
+                      f"FFT loss: {wl_fft.item():.6f} " +
+                      f"LPIPS loss: {wl_vgg.item():.6f} " +
+                      f"LCH loss: {wl_lch.item():.6f} ")
+                print(f" - Patch loss: {cumulative_patch_loss.item():.6f} " + 
+                      f"GAN loss: {wl_patch_gan.item():.6f} " +
+                      f"MSE loss: {wl_patch_mse.item():.6f} " +
+                      f"LAB loss: {wl_patch_lab.item():.6f} " +
+                      f"FFT loss: {wl_patch_fft.item():.6f} " +
+                      f"LPIPS loss: {wl_patch_vgg.item():.6f} " + 
+                      f"LCH loss: {wl_patch_lch.item():.6f} ")
+                print(f" - Discriminator loss: {d_loss.item():.6f}")
+                
+            #---------------- Statistics ----------------#
+
+        avg_loss = total_loss / dataloader_len
+
+        if avg_loss < best_loss:
+            best_loss = avg_loss
+
+        print(f"\nEpoch [{epoch+1}/{num_epochs}] - Average Loss: {avg_loss:.6f}")
+
+        torch.save(pbr_generator.state_dict(), last_model_path)
+
+        save_checkpoint(
+            generator     = pbr_generator,
+            discriminator = pbr_discriminator,
+            g_optimizer   = g_optimizer, 
+            d_optimizer   = d_optimizer,
+            g_scaler      = g_scaler, 
+            d_scaler      = d_scaler,
+            epoch         = epoch, 
+            loss          = avg_loss,
+            best_loss     = best_loss,
+            path          = checkpoint_path
+        )
+        print(f"Saved checkpoint")
+
+    #----------------------- Training loop -----------------------#
+
+    print(f"Best loss: {best_loss:.6f}")
+    print(f"Saved final model {run_name}")
+
+    iterations = list(range(len(image_losses['total'])))
+
+    plt.figure(figsize=(10, 6))
+
+    plt.plot(iterations, image_losses['total'], label='Image Loss', color='blue')
+    plt.plot(iterations, patch_losses['total'], label='Patch Loss', color='red')
+
+    plt.xlabel('Iteration')
+    plt.ylabel('Loss')
+    plt.title('Image Loss and Patch Loss')
+    plt.legend()
+    plt.grid(True)
+
+    if enable_logs:
+        plt.savefig(loss_graph_path)
+
+        with open(training_logs_path, mode='w', newline='') as file:
+            writer = csv.writer(file)
+            writer.writerow(['Epoch', 'Iteration', 'Loss', 'Patch Loss', 'MSE', 'Patch MSE', 'LAB', 
+                             'Patch LAB', 'FFT', 'Patch FFT'])
+
+            num_iterations = len(image_losses['total'])
+            for i in range(num_iterations):
+                epoch = epochs_executed[i]
+                writer.writerow([
+                    epoch, i,
+                    f"{image_losses['total'][i]:.6f}", f"{patch_losses['total'][i]:.6f}",
+                    f"{image_losses['mse'][i]:.6f}", f"{patch_losses['mse'][i]:.6f}",
+                    f"{image_losses['lab'][i]:.6f}", f"{patch_losses['lab'][i]:.6f}",
+                    f"{image_losses['fft'][i]:.6f}", f"{patch_losses['fft'][i]:.6f}"
+                ])
+        print("Saved logs")
+
+#----------------------------------------------------------------------------------------------------------#
+
+def main():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    pbr_input_dir = r"D:\Program Files\Python\Texture PBR Model\data\textures\ambientcg\color"
+    pbr_output_dir = r"D:\Program Files\Python\Texture PBR Model\data\textures\ambientcg\normaldx"
+
+    pbr_textures = LoadPBRData(pbr_input_dir, pbr_output_dir, crop_size=CROP_SIZE, image_size=IMAGE_RESOLUTION)
+    pbr_generator = PBRMapGeneratorUNet(in_channels=3, out_channels=3, base_channels=64).to(device)
+    pbr_discriminator = PBRPatchDiscriminator(in_channels=3, base_channels=64).to(device)
+
+    g_optimizer = optim.AdamW(pbr_generator.parameters(), 5e-4)
+    d_optimizer = optim.AdamW(pbr_discriminator.parameters(), 4e-4)
+
+    train(
+        device            = device, 
+        current_dir       = current_dir,
+        dataset           = pbr_textures,
+        pbr_generator     = pbr_generator,
+        g_optimizer       = g_optimizer,
+        pbr_discriminator = pbr_discriminator,
+        d_optimizer       = d_optimizer,
+        run_name          = "normaldx_v0.80_base",
+        ckpt_name         = "",
+        batch_size        = 18, 
+        num_workers       = 4,
+        num_epochs        = 3,
+        patch_size        = 64,
+        top_k_patches     = 0.1,
+        resume_training   = False,
+        visualize         = False,
+        stat_freq         = 10,
+        override_optim    = True,
+        enable_logs       = True
+    )
+
+#----------------------------------------------------------------------------------------------------------#
+
+if __name__ == "__main__":
+    main()

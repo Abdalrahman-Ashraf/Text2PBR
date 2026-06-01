@@ -1,0 +1,58 @@
+# Models / Checkpoints
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+*.bin
+
+# Datasets / Data
+TexturePBR/data/textures/
+datasets/
+debug/
+
+# Outputs / Generated Files
+outputs/
+inputs/
+logs/
+previous_outputs/
+output_maps/
+post_processed/
+training_logs/
+tmp/
+experiments/
+
+wandb/
+tb_logger/
+tb_logs/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+
+# Environments
+realesrgan_venv/
+.env
+.venv
+env/
+venv/
+ENV/
+
+# Build / Packaging
+build/
+dist/
+*.egg-info/
+
+# Jupyter / IDE
+.ipynb_checkpoints/
+.vscode/
+.idea/
+
+# OS Files
+.DS_Store
+Thumbs.db
+
+# Allow folder placeholders
+!*/.gitkeep
